@@ -7,6 +7,7 @@ import signal
 import json
 from datetime import datetime
 import sys
+import re
 import zmq
 from vplaned import Controller, ControllerException, DataplaneException
 
@@ -16,7 +17,9 @@ MAX_DURATION = 20 * 60
 SERVICE_NAME = "Ue-pkt-capture"
 BOX_WIDTH = 72
 UE_IP_RETRY_COUNT = 50
-UE_IP_RETRY_INTERVAL = 2  # seconds
+UE_IP_RETRY_INTERVAL = 2
+
+CONFIG_PATH = "/etc/vyatta/cfw-load-balancer-epdgdp.json"
 
 # ---------------- Dataplane Helper ----------------
 
@@ -27,24 +30,98 @@ def send_config_to_dataplane(cmds, logger=logging.getLogger(SERVICE_NAME)):
                 with dataplane:
                     for cmd in cmds:
                         logger.debug(f'Running: {cmd}')
-                        if 'cmd_name' in cmd:
-                            dataplane._socket.send_string('protobuf', flags=zmq.SNDMORE)
-                            dataplane._socket.send(cmd['cmd'])
-                            return dataplane._socket.recv_string()
-                        else:
+                        try:
                             return dataplane.json_command(cmd['cmd'])
-    except (ControllerException, DataplaneException, Exception):
-        logger.exception("Dataplane command failed")
-        print("==> ERROR: Unable to get Response from DP.")
-        sys.exit(1)
+                        except Exception:
+                            continue
+    except Exception:
+        return None
 
-# ---------------- UE IP & Port Lookup ----------------
+
+# ---------------- EPDGDPLB Helpers ----------------
+
+def load_dp_addresses():
+    try:
+        with open(CONFIG_PATH) as f:
+            text = f.read()
+
+        ips = re.findall(r'"epdgdp"\s*:\s*"([\d.]+)"', text)
+        return [f"tcp://{ip}:5555" for ip in ips]
+
+    except Exception:
+        return []
+
+
+def send_to_dp(dp_addr, cmd_str):
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REQ)
+
+    sock.setsockopt(zmq.LINGER, 1000)
+    sock.RCVTIMEO = 2000
+    sock.connect(dp_addr)
+
+    try:
+        sock.send_string(cmd_str)
+
+        try:
+            reply = sock.recv_string().strip()
+        except zmq.error.Again:
+            return None
+
+        if not reply:
+            return None
+
+        if reply.startswith('"') and reply.endswith('"'):
+            reply = json.loads(reply)
+
+        reply = re.sub(
+            r'"lb-info"\s*:\s*\{\s*\[([\s\S]*?)\]\s*\}',
+            r'"lb-info": [{\1}]',
+            reply
+        )
+
+
+        return json.loads(reply)
+
+    except Exception as e:
+        print(f"DEBUG: Failed reply -> {reply}")
+        return None
+
+    finally:
+        sock.close()
+        ctx.term()
+
+
+def get_epdg_ip_port(ue_identifier):
+    dp_addresses = load_dp_addresses()
+
+    if not dp_addresses:
+        return None, None
+
+    cmd = f"epdg-op show lb-info ueid {ue_identifier}"
+
+    for dp in dp_addresses:
+        resp = send_to_dp(dp, cmd)
+
+        if not resp or "error" in resp:
+            continue
+
+        lb_list = resp.get("lb-info")
+
+        if isinstance(lb_list, list) and len(lb_list) > 0:
+            lb = lb_list[0]
+            ap_ip = lb.get("ap_ip")
+            ap_port = lb.get("ap_port")
+
+            if ap_ip and ap_port:
+                return ap_ip, ap_port
+
+    return None, None
+
+
+# ---------------- UE Lookup ----------------
 
 def run_command_to_get_ip_port(ue_identifier: str, nodetype: str):
-    """
-    Queries the dataplane and parses the JSON for 'UE IP' and 'UE Port'.
-    Returns a tuple (ip, port) (for IMSDP), or (ip, None) (for TWAGDP) or (None, None).
-    """
 
     nodetype = nodetype.upper()
 
@@ -52,242 +129,180 @@ def run_command_to_get_ip_port(ue_identifier: str, nodetype: str):
         print("==> ERROR: UE identifier must be numeric MSISDN/IMSI")
         sys.exit(1)
 
-    # -------- IMSDP --------
+    # IMSDP
     if nodetype == "IMSDP":
-        command = f"imsdp-op show imsdp msisdn ip {ue_identifier}"
-        final_cmd = [{'cmd': command, 'oper': True}]
-        ret = send_config_to_dataplane(final_cmd)
+        cmd = f"imsdp-op show imsdp msisdn ip {ue_identifier}"
+        ret = send_config_to_dataplane([{'cmd': cmd, 'oper': True}])
 
-        if isinstance(ret, dict):
-            try:
-                ue_data = ret['imsdp_ue_msisdn_to_ip'][0]
-                ue_ip = ue_data.get('Local IP')
-                ue_port = ue_data.get('Local Port')
-                return ue_ip, ue_port
-            except (KeyError, IndexError):
-                return None, None
-    
-    # -------- TWAGDP --------
+        try:
+            ue = ret['imsdp_ue_msisdn_to_ip'][0]
+            return ue.get('Local IP'), ue.get('Local Port')
+        except Exception:
+            return None, None
+
+    # TWAGDP
     elif nodetype == "TWAGDP":
-        command = f"wigw-op show wigw ue imsi ip {ue_identifier}"
-        final_cmd = [{'cmd': command, 'oper': True}]
-        ret = send_config_to_dataplane(final_cmd)
+        cmd = f"wigw-op show wigw ue imsi ip {ue_identifier}"
+        ret = send_config_to_dataplane([{'cmd': cmd, 'oper': True}])
 
-        if isinstance(ret, dict):
-            try:
-                ue_data = ret['wigw_ue_ip_from_imsi']
-                ue_ip = ue_data.get('ue_ip')
-                return ue_ip, None
-            except (KeyError, IndexError):
-                return None, None
+        try:
+            return ret['wigw_ue_ip_from_imsi'].get('ue_ip'), None
+        except Exception:
+            return None, None
 
-    # --------- EPDGDPLB ------
+    # EPDGDPLB
     elif nodetype == "EPDGDPLB":
-        command = f"epdg-op show lb-info ue-id {ue_identifier}"
-        final_cmd = [{'cmd': command, 'oper': True}]
-        ret = send_config_to_dataplane(final_cmd)
-
-        if isinstance(ret, dict):
-            try:
-                ue_data = ret['wigw_ue_ip_from_imsi']
-                ue_ip = ue_data.get('ap_ip')
-                ue_port= ue_data.get('ap_port')
-                return ue_ip, ue_port
-            except (KeyError, IndexError):
-                return None, None
-
-
-
-    else:
-        print("==> ERROR: Unsupported nodetype. Supported for IMSDP & TWAGDP.")
-        sys.exit(1)
+        return get_epdg_ip_port(ue_identifier)
 
     return None, None
 
+
 def get_ue_details_with_retry(ue_identifier: str, nodetype: str, logger):
+
     print("==> INFO: Waiting for UE details....")
-    nodetype = nodetype.upper()
 
     for attempt in range(1, UE_IP_RETRY_COUNT + 1):
         try:
             logger.info(f"Attempt {attempt}/{UE_IP_RETRY_COUNT}")
+
             ue_ip, ue_port = run_command_to_get_ip_port(ue_identifier, nodetype)
 
-            if nodetype == "IMSDP" and ue_ip and ue_port:
+            if nodetype.upper() == "IMSDP" and ue_ip and ue_port:
                 return ue_ip, ue_port
-            
-            if nodetype == "TWAGDP" and ue_ip:
+
+            if nodetype.upper() == "TWAGDP" and ue_ip:
                 return ue_ip, None
+
+            if nodetype.upper() == "EPDGDPLB" and ue_ip and ue_port:
+                return ue_ip, ue_port
 
             if attempt < UE_IP_RETRY_COUNT:
                 time.sleep(UE_IP_RETRY_INTERVAL)
 
         except KeyboardInterrupt:
-            print("==> INFO: UE lookup interrupted by user")
             return None, None
-        except Exception as e:
-            logger.debug(f"UE lookup attempt failed: {e}")
 
     return None, None
 
-# ---------------- IP to Hex ----------------
-def ip_to_hex(ip: str):
-    return ''.join(f'{int(octet):02x}' for octet in ip.split('.'))
 
-# ---------------- Build BPF filter for TWAGDP ----------------
+# ---------------- BPF ----------------
+
+def ip_to_hex(ip: str):
+    return ''.join(f'{int(o):02x}' for o in ip.split('.'))
+
+
 def build_twagdp_bpf(ue_ip: str):
     ue_hex = ip_to_hex(ue_ip)
 
-    return f"""
-(
-  (host {ue_ip})
-  or
-  (ip proto gre and
-    ip[22:2] = 0x0800 and
-    (ip[36:4] = 0x{ue_hex} or ip[40:4] = 0x{ue_hex}))
-  or
-  (ip proto gre and
-    ip[22:2] = 0x6558 and
-    (ip[50:4] = 0x{ue_hex} or
-     ip[54:4] = 0x{ue_hex} or
-     ip[58:4] = 0x{ue_hex}))
-  or
-  (udp port 2152 and
-    (
-      udp[28:4] = 0x{ue_hex} or
-      udp[32:4] = 0x{ue_hex} or
-      udp[36:4] = 0x{ue_hex}))
-)
-""".strip()
+    return f"(host {ue_ip} or udp port 2152)"
 
 
 # ---------------- tcpdump ----------------
 
-def start_tcpdump(interface: str, ue_ip: str, ue_port: str, nodetype: str, output_file: str) -> subprocess.Popen:
-    """
-    Starts tcpdump with a filter.
-    IMSDP -> host IP and port.
-    TWAGDP -> host IP.
-    """
+def start_tcpdump(interface, ip, port, nodetype, output_file):
 
-    nodetype = nodetype.upper()
-
-    if nodetype == "IMSDP":
-        # Filter: host <IP> and port <PORT>
-        tcpdump_filter = f"host {ue_ip} and port {ue_port}"
-    elif nodetype == "TWAGDP":
-        tcpdump_filter = build_twagdp_bpf(ue_ip)
+    if nodetype in ["IMSDP", "EPDGDPLB"]:
+        filt = f"host {ip} and port {port}"
     else:
-        raise ValueError("Unsupported nodetype")
-    
-    command = [
-        "tcpdump",
-        "-i", interface,
-        "-w", output_file,
-        tcpdump_filter
-    ]
-    
+        filt = build_twagdp_bpf(ip)
+
+    cmd = ["tcpdump", "-i", interface, "-w", output_file, filt]
+
     return subprocess.Popen(
-        command,
+        cmd,
         preexec_fn=os.setsid,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True
     )
 
-# ---------------- UI Helpers ----------------
+
+# ---------------- UI ----------------
 
 def box_line_center(text=""):
     return f"║ {text.center(BOX_WIDTH - 4)} ║"
 
-# ---------------- Main ----------------
+
+# ---------------- MAIN ----------------
 
 def main():
+
     parser = argparse.ArgumentParser(description="UE tcpdump capture utility")
     parser.add_argument("nodetype")
     parser.add_argument("ue_identifier")
     parser.add_argument("interface")
     args = parser.parse_args()
 
-    nodetype = args.nodetype
-    ue_identifier = args.ue_identifier
+    nodetype = args.nodetype.upper()
+    ueid = args.ue_identifier
     interface = args.interface
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"{nodetype.upper()}_{ue_identifier}_{timestamp}.pcap"
+    outfile = f"{nodetype}_{ueid}_{timestamp}.pcap"
 
-    # ---- Interface check ----
     if not os.path.exists(f"/sys/class/net/{interface}"):
-        print(f"==> ERROR: Interface '{interface}' does not exist")
+        print(f"Interface {interface} not found")
         return
 
     logger = logging.getLogger(SERVICE_NAME)
 
-    # Fetch IP and Port
-    ue_ip, ue_port = get_ue_details_with_retry(ue_identifier, nodetype, logger)
+    ue_ip, ue_port = get_ue_details_with_retry(ueid, nodetype, logger)
 
-    if nodetype.upper() == "IMSDP":
-        if not ue_ip or not ue_port:
-            print("==> INFO: UE IP/Port not found. Exiting")
-            return
-    elif nodetype.upper() == "TWAGDP":
-        if not ue_ip:
-            print("==> INFO: UE IP not found. Exiting")
-            return
-    else:
-        print("==> INFO: UE Packet Capture is supported for IMSDP & TWAGDP!")
+    # Validation
+    if nodetype == "IMSDP" and (not ue_ip or not ue_port):
+        print("No UE IP/Port found")
         return
 
+    if nodetype == "TWAGDP" and not ue_ip:
+        print("No UE IP found")
+        return
+
+    if nodetype == "EPDGDPLB" and (not ue_ip or not ue_port):
+        print("No UE session found")
+        return
+
+    # UI
     print("╔" + "═" * (BOX_WIDTH - 2) + "╗")
-    print(box_line_center(f"!!! UE Packet Capture on {nodetype.upper()} !!!"))
+    print(box_line_center(f"!!! UE Packet Capture on {nodetype} !!!"))
     print("╠" + "═" * (BOX_WIDTH - 2) + "╣")
 
-    if nodetype.upper() == "IMSDP":
-        print(box_line_center(f"UE Msisdn : {ue_identifier}"))
-        print(box_line_center(f"UE IP[Port] : {ue_ip}[{ue_port}]"))
-    
-    if nodetype.upper() == "TWAGDP":
-        print(box_line_center(f"UE IP : {ue_ip}"))
+    if nodetype == "IMSDP":
+        print(box_line_center(f"UE MSISDN : {ueid}"))
 
+    if nodetype == "EPDGDPLB":
+        print(box_line_center(f"UE ID : {ueid}"))
+
+    print(box_line_center(f"UE IP[Port] : {ue_ip}[{ue_port}]"))
     print(box_line_center(f"Interface : {interface}"))
-    print(box_line_center(f"Max Duration : {MAX_DURATION // 60} min or Ctrl+C"))
-    print(box_line_center(f"File Name : {output_filename}"))
+    print(box_line_center(f"File : {outfile}"))
     print("╚" + "═" * (BOX_WIDTH - 2) + "╝")
 
-    if nodetype.upper() == "IMSDP":
-        print(f"==> INFO: Starting tcpdump on {interface} for {ue_ip}:{ue_port}")
-    else:
-        print(f"==> INFO: Starting tcpdump on {interface} for {ue_ip}")
-
+    print(f"Starting capture on {interface}...")
 
     process = None
     try:
-        process = start_tcpdump(interface, ue_ip, ue_port, nodetype, output_filename)
-        start_time = time.time()
+        process = start_tcpdump(interface, ue_ip, ue_port, nodetype, outfile)
+        start = time.time()
 
-        while time.time() - start_time < MAX_DURATION:
+        while time.time() - start < MAX_DURATION:
             if process.poll() is not None:
-                stderr = process.stderr.read().strip()
-                print(f"==> ERROR: tcpdump failed: {stderr}")
+                print("tcpdump failed:", process.stderr.readline())
                 return
             time.sleep(1)
 
-        print("==> INFO: Max duration reached. Stopping tcpdump")
-
     except KeyboardInterrupt:
-        print("==> INFO: Ctrl+C detected. Stopping tcpdump")
+        print("Stopping capture...")
 
     finally:
         if process and process.poll() is None:
             try:
-                os.killpg(process.pid, signal.SIGINT)
-                process.wait(timeout=5)
-            except Exception:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(os.getpgid(process.pid), signal.SIGINT)
+                process.wait(5)
+            except:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
 
-        print("==> INFO: Capture finished.")
+        print("Capture finished")
 
-# ---------------- Entry ----------------
 
 if __name__ == "__main__":
     main()
